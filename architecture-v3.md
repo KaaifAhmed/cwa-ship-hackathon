@@ -1,6 +1,6 @@
 # System Architecture
 
-**Project:** CWA Ship Karachi 2026
+**Project:** CWA Ship Karachi 2026 — Production-Grade AI Product
 **Status:** Pre-hackathon baseline — domain-agnostic, filled in at kickoff
 
 ## Diagram
@@ -41,86 +41,166 @@
 
 ## Components
 
-**Frontend** — React (Vite build), served as static files by a lightweight static server (e.g. `serve`), its own container. Talks directly to Main Service over HTTPS — no reverse proxy. Client-side routing (React Router) is fully separate from the backend's API routes.
+### Frontend
 
-**Main Service** — Django. Merges Auth and Core Domain into one project (`users` app + `core` app). The **only** component that touches Postgres — every other component that needs data goes through a Main Service endpoint, no exceptions. Exposes `/auth/*`, `/api/*`, enqueues jobs to Redis, exposes `GET /api/jobs/{job_id}` for polling, and `POST /api/whatsapp/inbound` for the WhatsApp webhook path. CORS enabled (`django-cors-headers`) for the frontend's origin. User model carries `phone_number` as a candidate key, so inbound WhatsApp messages can be resolved to a user. (Phone verification flagged as a possible addition, not committed — likely more complexity than the hackathon needs.)
+| Attribute | Value |
+|---|---|
+| Stack | Vite + React |
+| Delivery | Static files served by a lightweight static server, e.g. `serve` |
+| Runtime | Separate container |
+| Connection | Direct HTTPS to Main Service; no reverse proxy |
+| Routing | React Router; fully separate from backend API routes |
 
-**AI Worker Pool** — async Python, no web framework (never receives HTTP — only consumes `ai_queue`). Orchestration via LangGraph/LangChain, model calls via LiteLLM (see LLMOps section). 3 replicas. Guardrails: per-replica concurrency cap, per-job timeout, one retry with backoff. Fetches AI config (prompts, model tiers, fallback order) via a small internal Main Service endpoint, not direct DB access (see Dynamic Configuration).
+### Main Service
 
-**Background Worker** — same async pattern, consumes `tasks_queue`. One queue, many job types, dispatched internally by a `TASK_HANDLERS` map keyed on `job["type"]` — e.g. `generate_pdf`, `send_whatsapp_notification`, `send_otp`. This is the correct version of "one queue, filtered by worker": one homogeneous worker pool, multiple job types, not multiple worker pools sharing one queue. Handler implementations defined at kickoff; the dispatch pattern is fixed now.
+| Attribute | Value |
+|---|---|
+| Stack | Django |
+| Scope | Auth and Core Domain merged into one project |
+| Apps | `users` and `core` |
+| Database | The **only** component that touches Postgres; every other component uses a Main Service endpoint, no exceptions |
+| Endpoints | `/auth/*`, `/api/*`, `GET /api/jobs/{job_id}`, `POST /api/whatsapp/inbound` |
+| Jobs | Enqueues jobs to Redis |
+| CORS | `django-cors-headers`, enabled for the frontend origin |
+| User identity | `phone_number` is a candidate key so inbound WhatsApp messages can resolve to a user |
+| Phone verification | Possible addition, not committed; likely more complexity than the hackathon needs |
 
-**WhatsApp Service** — Express.js, pre-built ahead of the hackathon (unofficial library — official Business API approval lag ruled it out; session kept logged in and warm before the demo, since QR re-scans mid-demo are a real risk). A small HTTP API, not a queue consumer:
-- **Outbound:** `POST /whatsapp/send`, called **directly** by AI Worker Pool and Background Worker — not through Main Service. Two reasons: (1) large payloads (PDFs, media) never need to touch Main Service's request thread, and (2) an unofficial library is inherently flaky, so a hung WhatsApp session should never be able to degrade Main Service's own request/response cycle. Both workers call it through one shared helper module (avoids duplicating the HTTP client).
-- **Inbound:** WhatsApp webhook → WhatsApp Service → forwards a lightweight payload (sender phone number, text, a **media reference**, never raw file bytes) to Main Service's `/api/whatsapp/inbound`. Main Service validates it, resolves the phone number to a user, and enqueues a job — the untrusted-input boundary, so it's the one path that goes through Main Service. Whichever worker picks up that job fetches the actual media directly from the WhatsApp Service when it processes the job, not through Django.
-- A light per-phone-number rate limit sits on the inbound webhook — cheap protection against a flood of junk before the demo even starts.
+### AI Worker Pool
 
-**Redis** — one queue per worker pool: `ai_queue` (AI Worker Pool only) and `tasks_queue` (Background Worker only, multi-type via internal dispatch), plus worker heartbeat keys. `RPUSH`/`BLPOP`, no Celery, no channel layer.
+| Attribute | Value |
+|---|---|
+| Stack | Async Python; no web framework |
+| Replicas | 3 |
+| Input | Consumes `ai_queue` only; never receives HTTP |
+| AI stack | LangGraph/LangChain for orchestration; LiteLLM for model calls |
+| Guardrails | Per-replica concurrency cap, per-job timeout, one retry with backoff |
+| Configuration | Fetches prompts, model tiers, and fallback order through a small internal Main Service endpoint, not direct DB access |
 
-**Postgres** — one shared database, owned exclusively by Main Service. Domain schema defined at kickoff. AI config tables (prompts, model-tier mapping, fallback order) and the WhatsApp `phone_number` field are decided now.
+### Background Worker
+
+| Attribute | Value |
+|---|---|
+| Stack | Same async pattern as the AI Worker Pool |
+| Input | Consumes `tasks_queue` |
+| Dispatch | Internal `TASK_HANDLERS` map keyed on `job["type"]` |
+| Example jobs | `generate_pdf`, `send_whatsapp_notification`, `send_otp` |
+| Queue model | One homogeneous worker pool with many job types, not multiple worker pools sharing one queue |
+| Status | Handler implementations are defined at kickoff; the dispatch pattern is fixed now |
+
+### WhatsApp Service
+
+| Attribute | Value |
+|---|---|
+| Stack | Express.js |
+| Library | Pre-built unofficial library |
+| Preparation | Built ahead of the hackathon; session kept logged in and warm before the demo |
+| Official API | Official Business API approval lag ruled it out |
+| QR risk | QR re-scans mid-demo are a real risk |
+| Interface | Small HTTP API; not a queue consumer |
+| Rate limiting | Light per-phone-number limit on inbound webhook traffic, protecting against a flood of junk before the demo |
+
+#### WhatsApp Flows
+
+| Flow | Behavior |
+|---|---|
+| Outbound endpoint | `POST /whatsapp/send`, called directly by AI Worker Pool and Background Worker, not through Main Service |
+| Outbound rationale | Large payloads such as PDFs and media never touch Main Service's request thread. The unofficial library is inherently flaky, so a hung WhatsApp session cannot degrade Main Service's request/response cycle. |
+| Outbound client | Both workers use one shared helper module, avoiding duplicate HTTP clients. |
+| Inbound path | WhatsApp webhook → WhatsApp Service → Main Service `/api/whatsapp/inbound` |
+| Inbound payload | Lightweight payload containing sender phone number, text, and a **media reference**; never raw file bytes |
+| Inbound processing | Main Service validates the payload, resolves the phone number to a user, and enqueues a job. This is the untrusted-input boundary and the one path that goes through Main Service. |
+| Media processing | The worker that picks up the job fetches actual media directly from WhatsApp Service while processing it, not through Django. |
+
+### Redis
+
+| Attribute | Value |
+|---|---|
+| Queues | `ai_queue` for AI Worker Pool only; `tasks_queue` for Background Worker only, with multi-type internal dispatch |
+| Other data | Worker heartbeat keys |
+| Operations | `RPUSH`/`BLPOP` |
+| Exclusions | No Celery; no channel layer |
+
+### Postgres
+
+| Attribute | Value |
+|---|---|
+| Ownership | One shared database, owned exclusively by Main Service. `PGVector` gets a scoped, explicit exception. |
+| Schema | Domain schema defined at kickoff |
+| AI data | Config tables for prompts, model-tier mapping, and fallback order are decided now |
+| WhatsApp data | The `phone_number` field is decided now |
+| Access | Only Main Service ever reads or writes to it |
 
 ## Communication
 
-- Frontend ↔ Main Service: REST/JSON over HTTPS, CORS-enabled.
-- Main Service → AI/Background workers: Redis queues, not REST — avoids blocking a request thread on slow work.
-- AI/Background workers → WhatsApp Service: direct HTTP (outbound), via one shared client helper — no queue, no Main Service hop; nothing to validate on content you already decided.
-- WhatsApp Service → Main Service: HTTP webhook (inbound only) — the one path with untrusted external input, so it's the one path that goes through Main Service for validation before anything is enqueued.
-- AI Worker Pool → Main Service: internal HTTP endpoint for AI config, in place of direct Postgres access — keeps "only Main Service touches Postgres" true without exceptions. Cached briefly in-worker (~30–60s) so this isn't a round-trip on every single call.
-- Job status: frontend polls `GET /api/jobs/{job_id}`.
-- **Optional, not mandated:** Django Channels + WebSockets could replace polling with push-based updates if a specific need justifies it later. Not part of the baseline.
+| From → To | Transport | Contract and rationale |
+|---|---|---|
+| Frontend ↔ Main Service | REST/JSON over HTTPS | CORS-enabled |
+| Main Service → AI/Background workers | Redis queues, not REST | Avoids blocking a request thread on slow work |
+| AI/Background workers → WhatsApp Service | Direct HTTP, outbound | One shared client helper; no queue or Main Service hop; content is already decided and needs no validation |
+| WhatsApp Service → Main Service | HTTP webhook, inbound only | Untrusted external input is validated by Main Service before anything is enqueued |
+| AI Worker Pool → Main Service | Internal HTTP endpoint | Retrieves AI config instead of using direct Postgres access, keeping the database ownership rule intact. Cached briefly in-worker for approximately 30–60 seconds, so this is not a round-trip on every call. |
+| Frontend → Main Service | Polling `GET /api/jobs/{job_id}` | Retrieves job status |
+
+**Optional, not mandated:** Django Channels + WebSockets could replace polling with push-based updates if a specific need justifies it later. It is not part of the baseline.
 
 ## Contract-First Workflow
 
-1. Lock endpoint contracts (request/response shape, error cases) once the theme is known.
-2. Build against the contract in parallel.
-3. Integration is wiring real calls, not discovering shapes.
+| Step | Activity |
+|---|---|
+| 1 | At kickoff, spend approximately 20–30 minutes writing OpenAPI-style contracts for every service endpoint: request/response shape, status codes, and error cases. Lock them before implementation. |
+| 2 | Each service is implemented against its own contract, in parallel, by AI agents. |
+| 3 | Gateway and React frontend build against the contract using mocked responses before real services are ready. |
+| 4 | DRF auto-generates OpenAPI schemas through `drf-spectacular`; Swagger UI is served per service with no hand-written docs. |
+| 5 | Afternoon integration swaps mocks for live calls instead of discovering what an API returns. |
 
 ## Deployment
 
-Single VM, `docker-compose up -d` — one command for every container (frontend, Main Service, AI Worker Pool ×3, Background Worker, WhatsApp Service, Redis, Postgres). WhatsApp Service runs as a normal service like everything else — no gating needed now that it's already built.
+| Attribute | Value |
+|---|---|
+| Target | Single VM |
+| Command | `docker-compose up -d` |
+| Containers | Frontend, Main Service, AI Worker Pool ×3, Background Worker, WhatsApp Service, Redis, and Postgres |
+| WhatsApp Service | Runs as a normal service like everything else; no gating is needed because it is already built |
 
 ## Production-Readiness Checklist
 
-- [ ] Health/liveness signal per component (Main Service `/health`; workers via Redis heartbeat; WhatsApp Service `/health`)
+- [ ] Health/liveness signal per component: Main Service `/health`; workers through Redis heartbeat; WhatsApp Service `/health`
 - [ ] CI: lint + tests on push
 - [ ] Structured logging
-- [ ] `.env`-based config, no hardcoded secrets
-- [ ] API docs auto-served (DRF + `drf-spectacular`)
+- [ ] `.env`-based configuration with no hardcoded secrets
+- [ ] API docs auto-served through DRF + `drf-spectacular`
 - [ ] One-command local spin-up and deploy
-- [ ] WhatsApp session pre-authenticated and warm before the demo — not scanned live
+- [ ] WhatsApp session pre-authenticated and warm before the demo; not scanned live
 
-## AI Service Production-Readiness (LLMOps)
+## AI System
 
-**Orchestration:** LangGraph (built on LangChain) is the default for multi-step/agentic work — state graphs handle cycles and multi-agent coordination directly. Adopted as baseline: the code is AI-agent-authored, not hand-typed, so the framework's learning curve costs far less here than for a human team, and LangGraph's cycle/multi-agent support is genuinely hard to replicate by hand in the time available.
-
-**Model access:** LiteLLM is the calling layer underneath, wired into LangChain via `ChatLiteLLMRouter` (`langchain-litellm` package) — LangGraph nodes use it as a normal LangChain chat model, while LiteLLM's fallback chains and cost tracking run underneath.
-
-**Model tiers + fallback**, as a LiteLLM `Router` config: `fast` / `smart` tiers, each mapped to a primary model with an ordered fallback list. Swapping a rate-limited model mid-demo is a config change, not a code change.
-
-**Prompts:** LangChain `PromptTemplate`s, versioned as named files (e.g. `prompts/v1_summarize.py`). No separate templating library — LangChain covers it.
-
-**Structured output:** LangChain's native `.with_structured_output(PydanticModel)` handles validation and parsing directly — Instructor would be redundant, dropped.
-
-**Tool calling:** LangChain's tool interface (`@tool` decorator + `.bind_tools()`) — native provider function-calling underneath, LangChain's parsing on top instead of a hand-rolled loop.
-
-**RAG:** pgvector remains the vector store (already in Postgres); use LangChain's `PGVector` retriever so retrieval plugs directly into a graph node.
-
-**Streaming:** flagged as a probable stretch feature, not baseline. Channels/WebSockets (or SSE) to be decided once the rest of the system is stable and if time allows.
-
-**Guardrails:** per-replica concurrency cap, per-job timeout, one retry with backoff, full call telemetry in Postgres (`prompt_version`, `model`, `tokens`, `latency_ms`, `cost_estimate`).
+Full design — orchestration stack, model access, RAG, and security (agent-based, data-based, proactive threat management) — lives in docs/ai-system.md.
 
 ## Dynamic Configuration
 
-Made dynamic because it's cheap and high-value — not "everything," scoped deliberately:
+Dynamic configuration is scoped deliberately because it is cheap and high-value, not because everything should be dynamic.
 
-- **Prompt text + version**, **model tier → provider/model mapping**, **fallback chain order**, **per-prompt temperature/max_tokens** — stored as DB-backed config models owned by Main Service, edited via **Django Admin** (free CRUD UI, no custom dashboard needed).
-- AI Worker Pool fetches current config via a small internal Main Service endpoint (e.g. `GET /api/internal/ai-config`), not direct Postgres access — keeps "only Main Service touches Postgres" true. Cached in-worker for ~30–60s so this isn't a round-trip on every call.
-- **Deliberately NOT dynamic:** the orchestration graph structure, tool functions, and RAG chunking logic stay in code. Config values are dynamic; orchestration logic isn't.
+### Dynamic Values
+
+| Value | Storage and management |
+|---|---|
+| Prompt text + version | DB-backed config models owned by Main Service; edited via Django Admin |
+| Model tier → provider/model mapping | DB-backed config models owned by Main Service; edited via Django Admin |
+| Fallback chain order | DB-backed config models owned by Main Service; edited via Django Admin |
+| Per-prompt temperature/max_tokens | DB-backed config models owned by Main Service; edited via Django Admin |
+| Admin UI | Django Admin provides a free CRUD UI; no custom dashboard is needed |
+| Worker access | AI Worker Pool fetches current config from a small internal Main Service endpoint such as `GET /api/internal/ai-config`, not direct Postgres access. This keeps the database ownership rule intact. |
+| Cache | Config is cached in-worker for approximately 30–60 seconds, so this is not a round-trip on every call. |
+
+### Deliberately Not Dynamic
+
+The orchestration graph structure, tool functions, and RAG chunking logic stay in code. Config values are dynamic; orchestration logic is not.
 
 ## Repository Structure
 
 ```
 repo/
-├── docker-compose.yml
+├── compose.yml
 ├── shared/
 │   └── whatsapp_client.py      # imported by ai-worker and background-worker
 ├── frontend/
