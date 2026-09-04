@@ -20,6 +20,7 @@ echo "==> Bootstrapping project: $PROJECT_NAME"
 mkdir -p "$PROJECT_NAME"
 cd "$PROJECT_NAME"
 mkdir -p docs shared
+touch shared/__init__.py
 
 # Cross-platform venv activation (Linux/Mac: bin/, Windows Git Bash: Scripts/)
 activate_venv() {
@@ -28,9 +29,36 @@ activate_venv() {
   fi
 }
 
+stage_done() {
+  case "$1" in
+    1) [ -f frontend/package.json ] && [ -f frontend/vite.config.ts ] ;;
+    2) [ -f main-service/manage.py ] && [ -f main-service/requirements.txt ] ;;
+    3) [ -f ai-worker/main.py ] && [ -f ai-worker/requirements.txt ] ;;
+    4) [ -f background-worker/main.py ] && [ -f background-worker/requirements.txt ] ;;
+    5) [ -f shared/security_guards.py ] && [ -f shared/whatsapp_client.py ] ;;
+    6) [ -f whatsapp-service/index.js ] && [ -f whatsapp-service/package.json ] ;;
+    7) [ -f compose.yaml ] && [ -f .env.example ] && [ -f .gitignore ] && [ -f SETUP.md ] \
+      && [ -f frontend/Dockerfile ] && [ -f main-service/Dockerfile ] \
+      && [ -f ai-worker/Dockerfile ] && [ -f background-worker/Dockerfile ] \
+      && [ -f whatsapp-service/Dockerfile ] && [ -d .git ] ;;
+    *) return 1 ;;
+  esac
+}
+
+run_stage() {
+  local stage="$1"
+  if stage_done "$stage"; then
+    echo "==> [$stage/7] Already complete; skipping"
+    return 1
+  fi
+  return 0
+}
+
 # ============================================================================
 # 1. FRONTEND — React + Vite + TypeScript + Tailwind
 # ============================================================================
+run_stage 1 || true
+if ! stage_done 1; then
 echo "==> [1/7] Scaffolding frontend"
 npm create vite@latest frontend -- --template react-ts
 cd frontend
@@ -51,14 +79,18 @@ EOF
 { echo '@import "tailwindcss";'; cat src/index.css; } > src/index.css.tmp && mv src/index.css.tmp src/index.css
 echo "VITE_API_URL=http://localhost:8000" > .env.example
 cd ..
+fi
 
 # ============================================================================
 # 2. MAIN SERVICE — Django (Auth + Core, only component touching Postgres)
 # ============================================================================
+run_stage 2 || true
+if ! stage_done 2; then
 echo "==> [2/7] Scaffolding Main Service (Django)"
 python3 -m venv main-service/.venv
 activate_venv main-service/.venv
-pip install --upgrade pip
+python.exe -m pip install --upgrade pip
+
 pip install django djangorestframework djangorestframework-simplejwt \
   django-cors-headers drf-spectacular "psycopg[binary]" python-dotenv \
   pgvector gunicorn ruff pytest pytest-django
@@ -80,6 +112,8 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "dev-secret-key-change-me")
 DEBUG = os.environ.get("DEBUG", "True") == "True"
 ALLOWED_HOSTS = os.environ.get("ALLOWED_HOSTS", "*").split(",")
+CSRF_TRUSTED_ORIGINS = os.environ.get("CSRF_TRUSTED_ORIGINS", "http://localhost:5173").split(",")
+
 
 INSTALLED_APPS = [
     "django.contrib.admin", "django.contrib.auth", "django.contrib.contenttypes",
@@ -298,14 +332,23 @@ def whatsapp_inbound(request):
     # TODO (kickoff): resolve request.data["phone"] via UserProfile,
     # enqueue onto ai_queue or tasks_queue depending on intent.
     return JsonResponse({"success": True, "data": {"received": True}, "error": None})
+
+
+@api_view(["POST"])
+def log_ai_call(request):
+    # TODO (kickoff): persist to a real AICall model instead of just printing
+    # — see docs/ai-system.md §4.4 (agent identities) and §6.2 (audit trail).
+    print(f"[ai_call telemetry] {request.data}")
+    return JsonResponse({"success": True, "data": {"logged": True}, "error": None})
 EOF
 
 cat > core/urls.py << 'EOF'
 from django.urls import path
-from .views import ai_config, whatsapp_inbound
+from .views import ai_config, log_ai_call, whatsapp_inbound
 
 urlpatterns = [
     path("internal/ai-config", ai_config),
+    path("internal/ai-calls", log_ai_call),
     path("whatsapp/inbound", whatsapp_inbound),
 ]
 EOF
@@ -326,7 +369,8 @@ POSTGRES_PASSWORD=postgres
 POSTGRES_HOST=postgres
 POSTGRES_PORT=5432
 CORS_ALLOWED_ORIGINS=http://localhost:5173
-REDIS_URL=redis://redis:6379/0
+CSRF_TRUSTED_ORIGINS = http://localhost:5173
+REDIS_URL=redis://redis_server:6379/0
 EOF
 
 python manage.py makemigrations users
@@ -334,27 +378,31 @@ pip freeze > requirements.txt
 deactivate
 cd ..
 echo "==> Main Service scaffolded (auth working, phone_number field, AI-config + WhatsApp-inbound stubs)"
+fi
 
 # ============================================================================
 # 3. AI WORKER — async, LangGraph/LangChain/LiteLLM, no direct DB access
 # ============================================================================
+run_stage 3 || true
+if ! stage_done 3; then
 echo "==> [3/7] Scaffolding AI Worker"
 mkdir -p ai-worker
 python3 -m venv ai-worker/.venv
 activate_venv ai-worker/.venv
-pip install --upgrade pip
+python.exe -m pip install --upgrade pip
+
 pip install langgraph langchain langchain-litellm litellm \
   "redis[hiredis]" httpx pydantic python-dotenv ruff pytest pytest-asyncio
 
 cat > ai-worker/main.py << 'EOF'
 """
 AI Worker — consumes ai_queue, orchestrates via LangGraph/LangChain,
-calls models via LiteLLM (docs/architecture.md, LLMOps section).
+calls models via LiteLLM (docs/ai-system.md).
 
-Infra skeleton only: queue loop, concurrency cap, timeout, retry,
-heartbeat, and AI-config fetch (via Main Service, not direct DB —
-only Main Service touches Postgres). The LangGraph workflow in
-run_graph() is domain-specific and defined at kickoff.
+Infra skeleton: queue loop, concurrency cap, timeout, retry, heartbeat,
+AI-config fetch, agent roles (PLA/RBAC), input/output guards, and
+telemetry — all decided pre-hackathon per docs/ai-system.md. The
+LangGraph workflow in run_graph() is domain-specific, defined at kickoff.
 """
 import asyncio
 import json
@@ -364,6 +412,8 @@ import time
 import httpx
 import redis.asyncio as redis
 from dotenv import load_dotenv
+
+from shared.security_guards import input_guard, output_guard
 
 load_dotenv()
 
@@ -379,6 +429,16 @@ HEARTBEAT_KEY = f"heartbeat:ai-worker:{os.environ.get('HOSTNAME', 'unknown')}"
 semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
 _config_cache = {"data": None, "fetched_at": 0.0}
 
+# --- Agent roles (RBAC) — docs/ai-system.md §4.2. Code, not Dynamic
+# Config: permissions shouldn't be one Django-Admin click away from
+# being loosened. Tool names filled in at kickoff; each graph node is
+# bound to exactly one role's tool list, never the full registry.
+AGENT_ROLES = {
+    "retriever":       {"tools": [], "can_act_externally": False},
+    "responder":       {"tools": [], "can_act_externally": False},
+    "action_executor": {"tools": [], "can_act_externally": True},
+}
+
 
 async def get_ai_config() -> dict:
     """Fetched from Main Service, not Postgres directly — cached briefly to avoid a round-trip per call."""
@@ -392,19 +452,54 @@ async def get_ai_config() -> dict:
     return _config_cache["data"]
 
 
-async def run_graph(job: dict):
-    """TODO (kickoff): build the LangGraph workflow for this job's task type."""
+async def log_ai_call(**fields) -> None:
+    """Telemetry — docs/ai-system.md §4.4/§6.2. Posted to Main Service, not
+    written to Postgres directly (only Main Service touches Postgres)."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            await client.post(f"{MAIN_SERVICE_URL}/api/internal/ai-calls", json=fields)
+    except Exception as exc:  # noqa: BLE001 — telemetry failure must never break the job
+        print(f"telemetry log failed (non-fatal): {exc}")
+
+
+async def run_graph(job: dict, role: str):
+    """TODO (kickoff): build the LangGraph workflow for this job's task type,
+    using AGENT_ROLES[role]["tools"] to bind only that role's permitted tools."""
     raise NotImplementedError("Define the LangGraph workflow at kickoff")
 
 
 async def process_job(r: redis.Redis, job: dict):
     job_id = job["job_id"]
+    agent_role = job.get("agent_role", "responder")
+    started_at = time.time()
+
     async with semaphore:
         try:
-            result = await asyncio.wait_for(run_graph(job), timeout=JOB_TIMEOUT_SECONDS)
+            guard = input_guard(job.get("input", ""))
+            if not guard["ok"]:
+                raise ValueError(f"input rejected: {guard['reason']}")
+            if guard.get("flagged"):
+                print(f"[security] input flagged for job {job_id}: {guard['reason']}")
+
+            result = await asyncio.wait_for(run_graph(job, role=agent_role), timeout=JOB_TIMEOUT_SECONDS)
+
+            out_text = result if isinstance(result, str) else json.dumps(result)
+            out_guard = output_guard(out_text)
+            if not out_guard["ok"]:
+                raise ValueError(f"output blocked: {out_guard['reason']}")
+
             await r.set(f"result:{job_id}", json.dumps({"status": "done", "result": result}), ex=RESULT_TTL_SECONDS)
+            await log_ai_call(
+                job_id=job_id, agent_role=agent_role, status="done",
+                latency_ms=int((time.time() - started_at) * 1000),
+                flagged_input=guard.get("flagged", False),
+            )
         except Exception as exc:  # noqa: BLE001 — boundary catch, reported to caller
             await r.set(f"result:{job_id}", json.dumps({"status": "error", "error": str(exc)}), ex=RESULT_TTL_SECONDS)
+            await log_ai_call(
+                job_id=job_id, agent_role=agent_role, status="error",
+                latency_ms=int((time.time() - started_at) * 1000), error=str(exc),
+            )
 
 
 async def heartbeat_loop(r: redis.Redis):
@@ -428,7 +523,7 @@ if __name__ == "__main__":
 EOF
 
 cat > ai-worker/.env.example << 'EOF'
-REDIS_URL=redis://redis:6379/0
+REDIS_URL=redis://redis_server:6379/0
 MAIN_SERVICE_URL=http://main-service:8000
 WHATSAPP_SERVICE_URL=http://whatsapp-service:3001
 AI_WORKER_CONCURRENCY=5
@@ -440,15 +535,19 @@ EOF
 pip freeze > ai-worker/requirements.txt
 deactivate
 echo "==> AI Worker scaffolded"
+fi
 
 # ============================================================================
 # 4. BACKGROUND WORKER — async, non-AI tasks (PDF gen, WhatsApp notify, OTP)
 # ============================================================================
+run_stage 4 || true
+if ! stage_done 4; then
 echo "==> [4/7] Scaffolding Background Worker"
 mkdir -p background-worker
 python3 -m venv background-worker/.venv
 activate_venv background-worker/.venv
-pip install --upgrade pip
+python.exe -m pip install --upgrade pip
+
 pip install "redis[hiredis]" httpx weasyprint pydantic python-dotenv ruff pytest pytest-asyncio
 
 cat > background-worker/main.py << 'EOF'
@@ -476,7 +575,10 @@ HEARTBEAT_KEY = f"heartbeat:background-worker:{os.environ.get('HOSTNAME', 'unkno
 
 TASK_HANDLERS = {
     # "generate_pdf": handle_generate_pdf,
-    # "send_whatsapp_notification": handle_send_whatsapp_notification,
+    # "send_whatsapp_notification": handle_send_whatsapp_notification,  # uses
+    #     shared.whatsapp_client.send_whatsapp_message() — the output guard
+    #     (docs/ai-system.md §5.1) is enforced inside that shared client, so
+    #     handlers here don't need to call it separately.
     # "send_otp": handle_send_otp,
     # registered at kickoff
 }
@@ -516,7 +618,7 @@ if __name__ == "__main__":
 EOF
 
 cat > background-worker/.env.example << 'EOF'
-REDIS_URL=redis://redis:6379/0
+REDIS_URL=redis://redis_server:6379/0
 MAIN_SERVICE_URL=http://main-service:8000
 WHATSAPP_SERVICE_URL=http://whatsapp-service:3001
 EOF
@@ -524,33 +626,96 @@ EOF
 pip freeze > background-worker/requirements.txt
 deactivate
 echo "==> Background Worker scaffolded"
+fi
 
 # ============================================================================
-# 5. SHARED — WhatsApp HTTP client, imported by both Python workers
+# 5. SHARED — security guards + WhatsApp HTTP client, imported by both workers
 # ============================================================================
-echo "==> [5/7] Writing shared WhatsApp client"
+run_stage 5 || true
+if ! stage_done 5; then
+echo "==> [5/7] Writing shared security guards + WhatsApp client"
+
+cat > shared/security_guards.py << 'EOF'
+"""
+Input/output guards for AI-generated content — docs/ai-system.md §5.1.
+Imported by ai-worker and background-worker. Anything reaching an
+external channel (WhatsApp) or stored as a job result goes through
+these first. Pattern-based, not a full injection/DLP scanner — flags
+the common cases, doesn't try to catch everything.
+"""
+import re
+
+MAX_INPUT_LENGTH = 8000
+
+INJECTION_PATTERNS = [
+    r"ignore (all|any|previous) instructions",
+    r"disregard (the )?system prompt",
+    r"reveal (your|the) system prompt",
+    r"you are now",
+]
+
+SECRET_PATTERNS = [
+    r"sk-[a-zA-Z0-9]{20,}",      # generic API-key-shaped string
+    r"AIza[0-9A-Za-z\-_]{35}",   # Google-style key
+]
+
+
+def input_guard(text: str) -> dict:
+    """Flags likely prompt injection. Flags + logs by default rather than
+    hard-blocking — tighten to a hard block at kickoff if the theme's
+    risk profile warrants it."""
+    if not text or len(text) > MAX_INPUT_LENGTH:
+        return {"ok": False, "flagged": True, "reason": "empty_or_too_long"}
+    for pattern in INJECTION_PATTERNS:
+        if re.search(pattern, text, re.IGNORECASE):
+            return {"ok": True, "flagged": True, "reason": f"matched: {pattern}"}
+    return {"ok": True, "flagged": False, "reason": None}
+
+
+def output_guard(text: str) -> dict:
+    """Blocks obvious credential/secret leakage before anything leaves the system."""
+    if not text:
+        return {"ok": True, "reason": None}
+    for pattern in SECRET_PATTERNS:
+        if re.search(pattern, text):
+            return {"ok": False, "reason": "possible_secret_leak"}
+    return {"ok": True, "reason": None}
+EOF
+
 cat > shared/whatsapp_client.py << 'EOF'
 """
 Shared HTTP client for the WhatsApp Service's outbound send endpoint.
 Imported directly by ai-worker and background-worker (see architecture.md —
 outbound goes worker -> WhatsApp Service directly, never through Main Service).
+
+Every send is gated by the output guard (docs/ai-system.md §5.1) here,
+at the choke point — so no call site can forget the check.
 """
 import os
 import httpx
+
+from shared.security_guards import output_guard
 
 WHATSAPP_SERVICE_URL = os.environ.get("WHATSAPP_SERVICE_URL", "http://whatsapp-service:3001")
 
 
 async def send_whatsapp_message(phone: str, text: str) -> dict:
+    guard = output_guard(text)
+    if not guard["ok"]:
+        raise ValueError(f"blocked by output guard: {guard['reason']}")
+
     async with httpx.AsyncClient(timeout=10.0) as client:
         response = await client.post(f"{WHATSAPP_SERVICE_URL}/whatsapp/send", json={"phone": phone, "text": text})
         response.raise_for_status()
         return response.json()
 EOF
+fi
 
 # ============================================================================
 # 6. WHATSAPP SERVICE — Express, prebuilt, unofficial library
 # ============================================================================
+run_stage 6 || true
+if ! stage_done 6; then
 echo "==> [6/7] Scaffolding WhatsApp Service"
 mkdir -p whatsapp-service
 cd whatsapp-service
@@ -639,10 +804,13 @@ EOF
 
 cd ..
 echo "==> WhatsApp Service scaffolded (run it once standalone to scan the QR before the demo)"
+fi
 
 # ============================================================================
 # 7. DOCKER — Dockerfiles + compose.yaml, root files, git init
 # ============================================================================
+run_stage 7 || true
+if ! stage_done 7; then
 echo "==> [7/7] Writing Docker setup and root files"
 
 cat > frontend/Dockerfile << 'EOF'
@@ -728,6 +896,7 @@ services:
 
   redis:
     image: redis:7-alpine
+    container_name: redis_server
     ports:
       - "6379:6379"
 
@@ -736,7 +905,7 @@ services:
     env_file: .env
     environment:
       POSTGRES_HOST: postgres
-      REDIS_URL: redis://redis:6379/0
+      REDIS_URL: redis://redis_server:6379/0
     depends_on:
       - postgres
       - redis
@@ -749,7 +918,7 @@ services:
       dockerfile: ai-worker/Dockerfile
     env_file: .env
     environment:
-      REDIS_URL: redis://redis:6379/0
+      REDIS_URL: redis://redis_server:6379/0
       MAIN_SERVICE_URL: http://main-service:8000
       WHATSAPP_SERVICE_URL: http://whatsapp-service:3001
     depends_on:
@@ -762,7 +931,7 @@ services:
       dockerfile: background-worker/Dockerfile
     env_file: .env
     environment:
-      REDIS_URL: redis://redis:6379/0
+      REDIS_URL: redis://redis_server:6379/0
       MAIN_SERVICE_URL: http://main-service:8000
       WHATSAPP_SERVICE_URL: http://whatsapp-service:3001
     depends_on:
@@ -852,6 +1021,7 @@ EOF
 git init -q
 git add -A
 git commit -q -m "chore: bootstrap project scaffold from architecture.md"
+fi
 
 echo ""
 echo "============================================================"
