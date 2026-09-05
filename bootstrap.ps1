@@ -326,18 +326,43 @@ urlpatterns = [
 
     # --- core app: AI config + WhatsApp inbound endpoints (stubs - real logic at kickoff) ---
     @'
+import json
+import uuid
+
+import redis
+from django.conf import settings
 from django.http import JsonResponse
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny
 
 
+# Redis connection
+redis_client = redis.from_url(
+    settings.REDIS_URL,
+    decode_responses=True,
+)
+
+
+def envelope(data=None, error=None):
+    return {
+        "success": error is None,
+        "data": data,
+        "error": error,
+    }
+
+
 @api_view(["GET"])
+@permission_classes([AllowAny])
 def ai_config(request):
-    # TODO (kickoff): back with a real DB-backed config model + Django Admin
-    # -- see "Dynamic Configuration" in docs/architecture.md.
     return JsonResponse({
         "success": True,
-        "data": {"tiers": {"fast": None, "smart": None}, "fallback_order": []},
+        "data": {
+            "tiers": {
+                "fast": None,
+                "smart": None,
+            },
+            "fallback_order": [],
+        },
         "error": None,
     })
 
@@ -345,28 +370,163 @@ def ai_config(request):
 @api_view(["POST"])
 @permission_classes([AllowAny])
 def whatsapp_inbound(request):
-    # TODO (kickoff): resolve request.data["phone"] via UserProfile,
-    # enqueue onto ai_queue or tasks_queue depending on intent.
-    return JsonResponse({"success": True, "data": {"received": True}, "error": None})
+    return JsonResponse({
+        "success": True,
+        "data": {
+            "received": True,
+        },
+        "error": None,
+    })
 
 
 @api_view(["POST"])
+@permission_classes([AllowAny])
 def log_ai_call(request):
-    # TODO (kickoff): persist to a real AICall model instead of just printing
-    # -- see docs/ai-system.md par 4.4 (agent identities) and par 6.2 (audit trail).
     print(f"[ai_call telemetry] {request.data}")
-    return JsonResponse({"success": True, "data": {"logged": True}, "error": None})
+
+    return JsonResponse({
+        "success": True,
+        "data": {
+            "logged": True,
+        },
+        "error": None,
+    })
+
+
+# ============================================================
+# TEST JOB API
+# ============================================================
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def create_test_job(request):
+    """
+    Creates a test job and pushes it into Redis ai_queue.
+    """
+
+    job_id = str(uuid.uuid4())
+
+    message = request.data.get("message", "Hello from Postman")
+
+    job = {
+        "job_id": job_id,
+        "type": "test",
+        "agent_role": "responder",
+        "input": message,
+    }
+
+    # Push job into Redis queue
+    redis_client.rpush(
+        "ai_queue",
+        json.dumps(job),
+    )
+
+    print(f"[TEST] Job pushed to Redis: {job_id}")
+
+    return JsonResponse(
+        envelope(
+            data={
+                "job_id": job_id,
+                "status": "queued",
+                "message": message,
+            }
+        ),
+        status=202,
+    )
+
+
+@api_view(["GET"])
+@permission_classes([AllowAny])
+def get_test_job(request, job_id):
+    """
+    Gets the result produced by the worker.
+    """
+
+    result = redis_client.get(f"result:{job_id}")
+
+    if result is None:
+        return JsonResponse(
+            envelope(
+                data={
+                    "job_id": job_id,
+                    "status": "processing",
+                }
+            ),
+            status=202,
+        )
+
+    return JsonResponse(
+        envelope(
+            data=json.loads(result)
+        )
+    )
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def worker_result(request, job_id):
+    """
+    Worker calls this endpoint after completing a job.
+    """
+
+    payload = request.data
+
+    result = {
+        "status": payload.get("status", "done"),
+        "result": payload.get("result"),
+    }
+
+    redis_client.set(
+        f"result:{job_id}",
+        json.dumps(result),
+        ex=3600,
+    )
+
+    print(f"[TEST] Worker result received for job: {job_id}")
+
+    return JsonResponse(
+        envelope(
+            data={
+                "job_id": job_id,
+                "received": True,
+            }
+        )
+    )
+
+
 '@ | Set-Content -Path "core\views.py" -Encoding UTF8
 
     @'
 from django.urls import path
-from .views import ai_config, log_ai_call, whatsapp_inbound
+
+from .views import (
+    ai_config,
+    create_test_job,
+    get_test_job,
+    log_ai_call,
+    whatsapp_inbound,
+    worker_result,
+)
+
 
 urlpatterns = [
     path("internal/ai-config", ai_config),
     path("internal/ai-calls", log_ai_call),
+
     path("whatsapp/inbound", whatsapp_inbound),
+
+    # Test worker system
+    path("test-job", create_test_job),
+    path("test-job/<str:job_id>", get_test_job),
+
+    # Worker -> Django callback
+    path(
+        "internal/worker-result/<str:job_id>",
+        worker_result,
+    ),
 ]
+
+
 '@ | Set-Content -Path "core\urls.py" -Encoding UTF8
 
     @'
