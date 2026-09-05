@@ -89,6 +89,7 @@ export default defineConfig({
     ('@import "tailwindcss";' + "`r`n" + $existingCss) | Set-Content -Path "src\index.css" -Encoding UTF8
 
     "VITE_API_URL=http://localhost:8000" | Set-Content -Path ".env.example" -Encoding UTF8
+    Copy-Item ".env.example" ".env" -Force
     Pop-Location
 }
 
@@ -105,7 +106,7 @@ if (Stage-Done 2) {
     $venvPip = "main-service\.venv\Scripts\pip.exe"
 
     Invoke-Native "$venvPython -m pip install --upgrade pip"
-    Invoke-Native "$venvPip install django djangorestframework djangorestframework-simplejwt django-cors-headers drf-spectacular ""psycopg[binary]"" python-dotenv pgvector gunicorn ruff pytest pytest-django"
+    Invoke-Native "$venvPip install django djangorestframework djangorestframework-simplejwt django-cors-headers drf-spectacular ""psycopg[binary]"" python-dotenv pgvector gunicorn ruff pytest pytest-django ""redis[hiredis]"""
 
     Push-Location main-service
     $venvPythonRel = ".venv\Scripts\python.exe"
@@ -127,6 +128,8 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "dev-secret-key-change-me")
 DEBUG = os.environ.get("DEBUG", "True") == "True"
 ALLOWED_HOSTS = os.environ.get("ALLOWED_HOSTS", "*").split(",")
+CSRF_TRUSTED_ORIGINS = os.environ.get("CSRF_TRUSTED_ORIGINS", "http://localhost:5173").split(",")
+
 
 INSTALLED_APPS = [
     "django.contrib.admin", "django.contrib.auth", "django.contrib.contenttypes",
@@ -382,8 +385,10 @@ POSTGRES_PASSWORD=postgres
 POSTGRES_HOST=postgres
 POSTGRES_PORT=5432
 CORS_ALLOWED_ORIGINS=http://localhost:5173
-REDIS_URL=redis://redis:6379/0
+CSRF_TRUSTED_ORIGINS = http://localhost:5173
+REDIS_URL=redis://redis_server:6379/0
 '@ | Set-Content -Path ".env.example" -Encoding UTF8
+    Copy-Item ".env.example" ".env" -Force
 
     Invoke-Native "$venvPythonRel manage.py makemigrations users"
     Invoke-Native "$venvPipRel freeze > requirements.txt"
@@ -423,6 +428,7 @@ import time
 
 import httpx
 import redis.asyncio as redis
+from redis.exceptions import TimeoutError as RedisTimeoutError  # Added for exception handling
 from dotenv import load_dotenv
 
 from shared.security_guards import input_guard, output_guard
@@ -437,6 +443,10 @@ JOB_TIMEOUT_SECONDS = int(os.environ.get("AI_JOB_TIMEOUT", "60"))
 RESULT_TTL_SECONDS = 3600
 CONFIG_CACHE_TTL_SECONDS = 30
 HEARTBEAT_KEY = f"heartbeat:ai-worker:{os.environ.get('HOSTNAME', 'unknown')}"
+JOB_CALLBACK_URL = os.environ.get(
+    "JOB_CALLBACK_URL",
+    "http://main-service:8000/api/internal/worker-result"
+)
 
 semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
 _config_cache = {"data": None, "fetched_at": 0.0}
@@ -474,44 +484,183 @@ async def log_ai_call(**fields) -> None:
         print(f"telemetry log failed (non-fatal): {exc}")
 
 
+
 async def run_graph(job: dict, role: str):
-    """TODO (kickoff): build the LangGraph workflow for this job's task type,
-    using AGENT_ROLES[role]["tools"] to bind only that role's permitted tools."""
-    raise NotImplementedError("Define the LangGraph workflow at kickoff")
+    """
+    Temporary test task.
+
+    Later this function will contain the real LangGraph workflow.
+    """
+
+    if job.get("type") == "test":
+        message = job.get("input", "")
+
+        # Simulate doing some work
+        await asyncio.sleep(3)
+
+        return {
+            "message": f"Worker successfully processed: {message}",
+            "worker": "ai-worker",
+            "task_type": "test",
+            "processed": True,
+        }
+
+    raise ValueError(
+        f"Unknown job type: {job.get('type')}"
+    )
+
+
+
 
 
 async def process_job(r: redis.Redis, job: dict):
     job_id = job["job_id"]
     agent_role = job.get("agent_role", "responder")
+
     started_at = time.time()
 
     async with semaphore:
         try:
-            guard = input_guard(job.get("input", ""))
+            print(f"[WORKER] Processing job: {job_id}")
+
+            # -----------------------------
+            # Input security check
+            # -----------------------------
+
+            guard = input_guard(
+                job.get("input", "")
+            )
+
             if not guard["ok"]:
-                raise ValueError(f"input rejected: {guard['reason']}")
+                raise ValueError(
+                    f"input rejected: {guard['reason']}"
+                )
+
             if guard.get("flagged"):
-                print(f"[security] input flagged for job {job_id}: {guard['reason']}")
+                print(
+                    f"[security] input flagged for job "
+                    f"{job_id}: {guard['reason']}"
+                )
 
-            result = await asyncio.wait_for(run_graph(job, role=agent_role), timeout=JOB_TIMEOUT_SECONDS)
+            # -----------------------------
+            # Run worker task
+            # -----------------------------
 
-            out_text = result if isinstance(result, str) else json.dumps(result)
+            result = await asyncio.wait_for(
+                run_graph(
+                    job,
+                    role=agent_role,
+                ),
+                timeout=JOB_TIMEOUT_SECONDS,
+            )
+
+            out_text = (
+                result
+                if isinstance(result, str)
+                else json.dumps(result)
+            )
+
+            # -----------------------------
+            # Output security check
+            # -----------------------------
+
             out_guard = output_guard(out_text)
-            if not out_guard["ok"]:
-                raise ValueError(f"output blocked: {out_guard['reason']}")
 
-            await r.set(f"result:{job_id}", json.dumps({"status": "done", "result": result}), ex=RESULT_TTL_SECONDS)
-            await log_ai_call(
-                job_id=job_id, agent_role=agent_role, status="done",
-                latency_ms=int((time.time() - started_at) * 1000),
-                flagged_input=guard.get("flagged", False),
+            if not out_guard["ok"]:
+                raise ValueError(
+                    f"output blocked: {out_guard['reason']}"
+                )
+
+            # -----------------------------
+            # Save result in Redis
+            # -----------------------------
+
+            result_payload = {
+                "status": "done",
+                "result": result,
+            }
+
+            await r.set(
+                f"result:{job_id}",
+                json.dumps(result_payload),
+                ex=RESULT_TTL_SECONDS,
             )
-        except Exception as exc:  # noqa: BLE001 - boundary catch, reported to caller
-            await r.set(f"result:{job_id}", json.dumps({"status": "error", "error": str(exc)}), ex=RESULT_TTL_SECONDS)
-            await log_ai_call(
-                job_id=job_id, agent_role=agent_role, status="error",
-                latency_ms=int((time.time() - started_at) * 1000), error=str(exc),
+
+            # -----------------------------
+            # Send result back to Django
+            # -----------------------------
+
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.post(
+                    f"{JOB_CALLBACK_URL}/{job_id}",
+                    json=result_payload,
+                )
+
+                response.raise_for_status()
+
+            latency = int(
+                (time.time() - started_at) * 1000
             )
+
+            print(
+                f"[WORKER] Job {job_id} completed "
+                f"in {latency}ms"
+            )
+
+            await log_ai_call(
+                job_id=job_id,
+                agent_role=agent_role,
+                status="done",
+                latency_ms=latency,
+                flagged_input=guard.get(
+                    "flagged",
+                    False,
+                ),
+            )
+
+        except Exception as exc:
+            error_payload = {
+                "status": "error",
+                "error": str(exc),
+            }
+
+            # Save error in Redis
+            await r.set(
+                f"result:{job_id}",
+                json.dumps(error_payload),
+                ex=RESULT_TTL_SECONDS,
+            )
+
+            # Send error back to Django
+            try:
+                async with httpx.AsyncClient(
+                    timeout=5.0
+                ) as client:
+                    await client.post(
+                        f"{JOB_CALLBACK_URL}/{job_id}",
+                        json=error_payload,
+                    )
+            except Exception as callback_error:
+                print(
+                    f"[WORKER] Callback failed: "
+                    f"{callback_error}"
+                )
+
+            print(
+                f"[WORKER] Job {job_id} failed: {exc}"
+            )
+
+            await log_ai_call(
+                job_id=job_id,
+                agent_role=agent_role,
+                status="error",
+                latency_ms=int(
+                    (time.time() - started_at) * 1000
+                ),
+                error=str(exc),
+            )
+
+
 
 
 async def heartbeat_loop(r: redis.Redis):
@@ -525,9 +674,25 @@ async def main():
     asyncio.create_task(heartbeat_loop(r))
     print(f"AI worker started, listening on '{QUEUE_NAME}'")
     while True:
-        _, raw_job = await r.blpop(QUEUE_NAME)
-        job = json.loads(raw_job)
-        asyncio.create_task(process_job(r, job))
+        try:
+            # Replaced the infinite block with a timeout to prevent socket hangs
+            job_data = await r.blpop(QUEUE_NAME, timeout=5)
+
+            # If the queue was empty for 5 seconds, loop and try again
+            if not job_data:
+                continue
+
+            _, raw_job = job_data
+            job = json.loads(raw_job)
+            asyncio.create_task(process_job(r, job))
+
+        except (RedisTimeoutError, TimeoutError):
+            # Suppress socket timeouts and just restart the polling loop
+            continue
+        except Exception as e:
+            # Catch transient network errors so the worker doesn't die completely
+            print(f"Worker polling error: {e}")
+            await asyncio.sleep(1)
 
 
 if __name__ == "__main__":
@@ -535,7 +700,7 @@ if __name__ == "__main__":
 '@ | Set-Content -Path "ai-worker\main.py" -Encoding UTF8
 
     @'
-REDIS_URL=redis://redis:6379/0
+REDIS_URL=redis://redis_server:6379/0
 MAIN_SERVICE_URL=http://main-service:8000
 WHATSAPP_SERVICE_URL=http://whatsapp-service:3001
 AI_WORKER_CONCURRENCY=5
@@ -543,6 +708,7 @@ AI_JOB_TIMEOUT=60
 OPENAI_API_KEY=
 ANTHROPIC_API_KEY=
 '@ | Set-Content -Path "ai-worker\.env.example" -Encoding UTF8
+    Copy-Item "ai-worker\.env.example" "ai-worker\.env" -Force
 
     Invoke-Native "$venvPip freeze > ai-worker\requirements.txt"
     Write-Host "==> AI Worker scaffolded"
@@ -577,6 +743,7 @@ import os
 import time
 
 import redis.asyncio as redis
+from redis.exceptions import TimeoutError as RedisTimeoutError  # Added for exception handling
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -621,9 +788,25 @@ async def main():
     asyncio.create_task(heartbeat_loop(r))
     print(f"Background worker started, listening on '{QUEUE_NAME}'")
     while True:
-        _, raw_job = await r.blpop(QUEUE_NAME)
-        job = json.loads(raw_job)
-        asyncio.create_task(process_job(r, job))
+        try:
+            # Replaced the infinite block with a timeout to prevent socket hangs
+            job_data = await r.blpop(QUEUE_NAME, timeout=5)
+
+            # If the queue was empty for 5 seconds, loop and try again
+            if not job_data:
+                continue
+
+            _, raw_job = job_data
+            job = json.loads(raw_job)
+            asyncio.create_task(process_job(r, job))
+
+        except (RedisTimeoutError, TimeoutError):
+            # Suppress socket timeouts and just restart the polling loop
+            continue
+        except Exception as e:
+            # Catch transient network errors so the worker doesn't die completely
+            print(f"Worker polling error: {e}")
+            await asyncio.sleep(1)
 
 
 if __name__ == "__main__":
@@ -631,10 +814,11 @@ if __name__ == "__main__":
 '@ | Set-Content -Path "background-worker\main.py" -Encoding UTF8
 
     @'
-REDIS_URL=redis://redis:6379/0
+REDIS_URL=redis://redis_server:6379/0
 MAIN_SERVICE_URL=http://main-service:8000
 WHATSAPP_SERVICE_URL=http://whatsapp-service:3001
 '@ | Set-Content -Path "background-worker\.env.example" -Encoding UTF8
+    Copy-Item "background-worker\.env.example" "background-worker\.env" -Force
 
     Invoke-Native "$venvPip freeze > background-worker\requirements.txt"
     Write-Host "==> Background Worker scaffolded"
@@ -815,6 +999,7 @@ app.listen(3001, () => console.log("WhatsApp Service listening on :3001"));
     @'
 MAIN_SERVICE_URL=http://main-service:8000
 '@ | Set-Content -Path ".env.example" -Encoding UTF8
+    Copy-Item ".env.example" ".env" -Force
 
     Pop-Location
     Write-Host "==> WhatsApp Service scaffolded (run it once standalone to scan the QR before the demo)"
@@ -911,6 +1096,7 @@ services:
 
   redis:
     image: redis:7-alpine
+    container_name: redis_server
     ports:
       - "6379:6379"
 
@@ -919,7 +1105,7 @@ services:
     env_file: .env
     environment:
       POSTGRES_HOST: postgres
-      REDIS_URL: redis://redis:6379/0
+      REDIS_URL: redis://redis_server:6379/0
     depends_on:
       - postgres
       - redis
@@ -932,9 +1118,10 @@ services:
       dockerfile: ai-worker/Dockerfile
     env_file: .env
     environment:
-      REDIS_URL: redis://redis:6379/0
+      REDIS_URL: redis://redis_server:6379/0
       MAIN_SERVICE_URL: http://main-service:8000
       WHATSAPP_SERVICE_URL: http://whatsapp-service:3001
+      JOB_CALLBACK_URL: http://main-service:8000/api/internal/worker-result
     depends_on:
       - redis
       - main-service
@@ -945,7 +1132,7 @@ services:
       dockerfile: background-worker/Dockerfile
     env_file: .env
     environment:
-      REDIS_URL: redis://redis:6379/0
+      REDIS_URL: redis://redis_server:6379/0
       MAIN_SERVICE_URL: http://main-service:8000
       WHATSAPP_SERVICE_URL: http://whatsapp-service:3001
     depends_on:
@@ -984,14 +1171,19 @@ DJANGO_SECRET_KEY=change-me
 DEBUG=True
 ALLOWED_HOSTS=*
 CORS_ALLOWED_ORIGINS=http://localhost:5173
+CSRF_TRUSTED_ORIGINS=http://localhost:5173
 
 # Redis
-REDIS_URL=redis://redis:6379/0
+REDIS_URL=redis://redis_server:6379/0
+
+# AI Worker callback
+JOB_CALLBACK_URL=http://main-service:8000/api/internal/worker-result
 
 # LLM providers (fill in at kickoff)
 OPENAI_API_KEY=
 ANTHROPIC_API_KEY=
 '@ | Set-Content -Path ".env.example" -Encoding UTF8
+    Copy-Item ".env.example" ".env" -Force
 
     @'
 __pycache__/
@@ -1012,7 +1204,10 @@ whatsapp-service/auth/
 Scaffold reference, not the final project README (that's a Phase 8
 deliverable - see docs/documentation-guide.md).
 
-1. Copy `.env.example` to `.env` and fill in real values (LLM API keys especially).
+1. `.env` files are auto-generated (copied from each `.env.example`) by this
+   script. Open each one and fill in real values (LLM API keys especially) --
+   root `.env`, `main-service\.env`, `ai-worker\.env`, `background-worker\.env`,
+   `whatsapp-service\.env`, `frontend\.env`.
 2. Place the pre-hackathon docs into `docs/` (architecture.md, sdlc.md,
    coding-guidelines.md, testing-guidelines.md, documentation-guide.md,
    ux-guide.md, ui-guide.md).
@@ -1044,7 +1239,7 @@ Write-Host ""
 Write-Host " Next steps:"
 Write-Host "  1. cd $ProjectName"
 Write-Host "  2. Drop the 7 doc files into docs\"
-Write-Host "  3. copy .env.example .env   (then fill in real secrets/keys)"
+Write-Host "  3. .env files were auto-generated in each service folder -- open them and fill in real secrets/keys"
 Write-Host "  4. Pre-auth WhatsApp: cd whatsapp-service; node index.js (scan QR, then Ctrl+C)"
 Write-Host "  5. docker compose up -d --build --scale ai-worker=3"
 Write-Host "  6. docker compose exec main-service python manage.py migrate"
