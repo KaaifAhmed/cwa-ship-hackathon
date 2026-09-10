@@ -1,11 +1,11 @@
 #Requires -Version 5.1
 <#
 ============================================================================
- CWA Ship Karachi 2026 - Project Bootstrap (Windows / PowerShell, v2)
+ CWA Ship Karachi 2026 - Project Bootstrap (Windows / PowerShell, v3)
 
  Scaffolds architecture.md: frontend / main-service (Django, Auth+Core) /
  ai-worker (LangGraph+LangChain+LiteLLM) / background-worker /
- whatsapp-service (Express, prebuilt) / compose.yaml
+ whatsapp-service (Express + TypeScript, Baileys) / compose.yaml
 
  Usage:
    bootstrap.bat [project-name]
@@ -50,7 +50,11 @@ function Stage-Done {
         3 { return (Test-Path "ai-worker\main.py") -and (Test-Path "ai-worker\requirements.txt") }
         4 { return (Test-Path "background-worker\main.py") -and (Test-Path "background-worker\requirements.txt") }
         5 { return (Test-Path "shared\security_guards.py") -and (Test-Path "shared\whatsapp_client.py") }
-        6 { return (Test-Path "whatsapp-service\index.js") -and (Test-Path "whatsapp-service\package.json") }
+        6 {
+            return (Test-Path "whatsapp-service\src\server.ts") -and (Test-Path "whatsapp-service\src\whatsapp.ts") `
+                -and (Test-Path "whatsapp-service\src\config.ts") -and (Test-Path "whatsapp-service\package.json") `
+                -and (Test-Path "whatsapp-service\tsconfig.json")
+        }
         7 {
             return (Test-Path "compose.yaml") -and (Test-Path ".env.example") -and (Test-Path ".gitignore") `
                 -and (Test-Path "SETUP.md") -and (Test-Path "frontend\Dockerfile") `
@@ -370,17 +374,39 @@ def ai_config(request):
         "error": None,
     })
 
+from rest_framework.response import Response
+
 
 @api_view(["POST"])
 @permission_classes([AllowAny])
 def whatsapp_inbound(request):
-    return JsonResponse({
-        "success": True,
-        "data": {
-            "received": True,
-        },
-        "error": None,
-    })
+    data = request.data
+    print("here")
+
+    phone = data.get("from")
+    jid = data.get("jid")
+    sender_name = data.get("senderName")
+    text = data.get("text", "")
+    message_id = data.get("messageId")
+    timestamp = data.get("timestamp")
+
+    if not phone:
+        return Response(
+            {
+                "success": False,
+                "error": "from is required"
+            },
+            status=404
+        )
+
+    if not text:
+        return Response(
+            {
+                "success": False,
+                "error": "text is required"
+            },
+            status=404
+        )
 
 
 @api_view(["POST"])
@@ -793,6 +819,7 @@ urlpatterns = [
         "internal/worker-pdf-result/<str:job_id>",
         worker_pdf_result
     ),
+    path("whatsapp/inbound" , whatsapp_inbound, name="whatsapp_inbound"),
 ]
 
 
@@ -1578,13 +1605,17 @@ outbound goes worker -> WhatsApp Service directly, never through Main Service).
 
 Every send is gated by the output guard (docs/ai-system.md par 5.1) here,
 at the choke point - so no call site can forget the check.
+
+The gateway itself now exposes both POST /whatsapp/send and the legacy alias
+POST /api/whatsapp/send, and accepts {to|phone|recipient} / {message|text} -
+we send the canonical {phone, text} shape shown below.
 """
 import os
 import httpx
 
 from shared.security_guards import output_guard
 
-WHATSAPP_SERVICE_URL = os.environ.get("WHATSAPP_SERVICE_URL", "http://whatsapp-service:3001")
+WHATSAPP_SERVICE_URL = os.environ.get("WHATSAPP_SERVICE_URL", "http://whatsapp-service:3000")
 
 
 async def send_whatsapp_message(phone: str, text: str) -> dict:
@@ -1600,100 +1631,373 @@ async def send_whatsapp_message(phone: str, text: str) -> dict:
 }
 
 # ============================================================================
-# 6. WHATSAPP SERVICE - Express, prebuilt, unofficial library
+# 6. WHATSAPP SERVICE - Express + TypeScript, Baileys, unofficial library
 # ============================================================================
 if (Stage-Done 6) {
     Write-Host "==> [6/7] Already complete; skipping"
 } else {
-    Write-Host "==> [6/7] Scaffolding WhatsApp Service"
-    New-Item -ItemType Directory -Force -Path "whatsapp-service" | Out-Null
+    Write-Host "==> [6/7] Scaffolding WhatsApp Service (TypeScript / Express)"
+    New-Item -ItemType Directory -Force -Path "whatsapp-service\src" | Out-Null
     Push-Location whatsapp-service
-    Invoke-Native "npm init -y"
-    Invoke-Native "npm pkg set type=commonjs"
-    Invoke-Native "npm install express @whiskeysockets/baileys"
 
     @'
-/**
- * WhatsApp Service - small HTTP API, not a queue consumer.
- * Outbound: POST /whatsapp/send, called directly by the AI Worker Pool
- *   and Background Worker (via shared/whatsapp_client.py).
- * Inbound: forwards a lightweight payload (phone, text, media reference --
- *   never raw file bytes) to Main Service's /api/whatsapp/inbound.
- *
- * Pre-authenticate before the demo: run this once ahead of time, scan the
- * QR code, and the ./auth session folder keeps it logged in -- don't scan
- * live during judging.
- */
-const express = require("express");
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require("@whiskeysockets/baileys");
+{
+  "name": "whatsapp_geteway",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "dev": "tsx src/server.ts",
+    "build": "tsc",
+    "start": "npm run build && node dist/server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@hapi/boom": "^10.0.1",
+    "@whiskeysockets/baileys": "^7.0.0-rc14",
+    "axios": "^1.19.0",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "pino": "^10.3.1",
+    "qrcode-terminal": "^0.12.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.2.0",
+    "@types/qrcode-terminal": "^0.12.2",
+    "tsx": "^4.23.12",
+    "typescript": "^7.0.2"
+  }
+}
+'@ | Set-Content -Path "package.json" -Encoding UTF8
 
-const app = express();
-app.use(express.json());
+    @'
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "outDir": "dist",
+    "rootDir": "src",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true
+  },
+  "include": ["src"]
+}
+'@ | Set-Content -Path "tsconfig.json" -Encoding UTF8
 
-const MAIN_SERVICE_URL = process.env.MAIN_SERVICE_URL || "http://main-service:8000";
-let sock;
+    @'
+import dotenv from "dotenv";
 
-async function startWhatsApp() {
-  const { state, saveCreds } = await useMultiFileAuthState("./auth");
-  sock = makeWASocket({ auth: state, printQRInTerminal: true });
-  sock.ev.on("creds.update", saveCreds);
+dotenv.config();
 
-  sock.ev.on("connection.update", (update) => {
-    const { connection, lastDisconnect } = update;
-    if (connection === "close") {
-      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-      console.log("WhatsApp connection closed, reconnecting:", shouldReconnect);
-      if (shouldReconnect) startWhatsApp();
-    } else if (connection === "open") {
-      console.log("WhatsApp connected");
-    }
-  });
+function requiredEnv(name: string): string {
+  const value = process.env[name]?.trim();
 
-  sock.ev.on("messages.upsert", async ({ messages }) => {
-    for (const msg of messages) {
-      if (!msg.message || msg.key.fromMe) continue;
-      const phone = msg.key.remoteJid?.split("@")[0];
-      const text = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
-      const mediaRef = msg.key.id; // reference only -- worker fetches full media when it processes the job
+  if (!value) {
+    throw new Error(`Missing required environment variable: ${name}`);
+  }
 
-      try {
-        await fetch(`${MAIN_SERVICE_URL}/api/whatsapp/inbound`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ phone, text, media_ref: mediaRef }),
-        });
-      } catch (err) {
-        console.error("Failed to forward inbound message:", err);
-      }
-    }
-  });
+  return value;
 }
 
-app.post("/whatsapp/send", async (req, res) => {
-  const { phone, text } = req.body;
+const port = Number(requiredEnv("PORT"));
+
+if (!Number.isInteger(port) || port < 1 || port > 65535) {
+  throw new Error("PORT must be an integer between 1 and 65535");
+}
+
+export const config = {
+  port,
+  authDir: requiredEnv("AUTH_DIR"),
+  mainServiceInboundUrl: requiredEnv("MAIN_SERVICE_INBOUND_URL"),
+};
+'@ | Set-Content -Path "src\config.ts" -Encoding UTF8
+
+    @'
+import makeWASocket, {
+  DisconnectReason,
+  useMultiFileAuthState,
+  WASocket,
+} from "@whiskeysockets/baileys";
+import { Boom } from "@hapi/boom";
+import qrcode from "qrcode-terminal";
+import pino from "pino";
+import axios from "axios";
+import fs from "fs";
+
+import { config } from "./config.js";
+
+class WhatsAppService {
+  private sock: WASocket | null = null;
+  private qr: string | null = null;
+  private isConnecting = false;
+
+  public isConnected(): boolean {
+    return Boolean(this.sock && this.sock.user);
+  }
+
+  public getQr(): string | null {
+    return this.isConnected() ? null : this.qr;
+  }
+
+  public getUser() {
+    if (!this.sock?.user) return null;
+    return {
+      id: this.sock.user.id,
+      phone: this.sock.user.id?.split(":")?.[0] || this.sock.user.id,
+      name: this.sock.user.name || null,
+    };
+  }
+
+  public async init(): Promise<void> {
+    if (this.isConnecting) return;
+    this.isConnecting = true;
+
+    try {
+      const { state, saveCreds } = await useMultiFileAuthState(config.authDir);
+
+      this.sock = makeWASocket({
+        auth: state,
+        logger: pino({ level: "silent" }),
+        markOnlineOnConnect: false,
+      });
+
+      this.sock.ev.on("creds.update", saveCreds);
+
+      this.sock.ev.on("connection.update", (update) => {
+        const { connection, lastDisconnect, qr } = update;
+
+        if (qr) {
+          this.qr = qr;
+          console.log("\n====================================");
+          console.log("SCAN THIS QR CODE WITH WHATSAPP:");
+          console.log("====================================");
+          qrcode.generate(qr, { small: true });
+          console.log("Raw QR String available at GET /qr\n");
+        }
+
+        if (connection === "open") {
+          console.log("Connected as:", this.sock?.user?.id);
+          this.qr = null;
+          this.isConnecting = false;
+        }
+
+        if (connection === "close") {
+          this.isConnecting = false;
+          this.sock = null;
+
+          const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
+          console.log(`WhatsApp disconnected (status code: ${statusCode || "unknown"})`);
+
+          if (statusCode === DisconnectReason.loggedOut) {
+            console.log("Logged out. Resetting auth directory for new QR generation.");
+            this.qr = null;
+            try {
+              fs.rmSync(config.authDir, { recursive: true, force: true });
+            } catch (err) {
+              console.error("Error clearing auth directory:", err);
+            }
+            setTimeout(() => this.init(), 3000);
+            return;
+          }
+
+          console.log("Reconnecting in 5 seconds...");
+          setTimeout(() => this.init(), 5000);
+        }
+      });
+
+      this.sock.ev.on("messages.upsert", async ({ messages }) => {
+        for (const msg of messages) {
+          await this.handleInboundMessage(msg);
+        }
+      });
+    } catch (error) {
+      this.isConnecting = false;
+      this.sock = null;
+      console.error("Failed to initialize WhatsApp connection:", error);
+      setTimeout(() => this.init(), 5000);
+    }
+  }
+
+  private async handleInboundMessage(msg: any): Promise<void> {
+    try {
+      if (!msg.message || msg.key.fromMe) return;
+
+      const remoteJid = msg.key.remoteJid || "";
+
+      // 1-on-1 direct messaging only: ignore groups & status broadcasts
+      if (remoteJid.endsWith("@g.us") || remoteJid.includes("broadcast")) return;
+
+      const text =
+        msg.message.conversation ||
+        msg.message.extendedTextMessage?.text ||
+        msg.message.imageMessage?.caption ||
+        msg.message.videoMessage?.caption ||
+        "";
+
+      const phone = remoteJid.replace("@s.whatsapp.net", "");
+
+      const payload = {
+        from: phone,
+        jid: remoteJid,
+        senderName: msg.pushName || null,
+        text,
+        messageId: msg.key.id,
+        timestamp: Number(msg.messageTimestamp),
+      };
+
+      console.log(`Inbound message from ${phone}: "${text.slice(0, 60)}"`);
+
+      await axios.post(config.mainServiceInboundUrl, payload, { timeout: 5000 });
+    } catch (error: any) {
+      if (error.config?.url) {
+        console.error(
+          `Failed to dispatch inbound message to ${config.mainServiceInboundUrl}:`,
+          error.message
+        );
+      } else {
+        console.error("Error processing inbound message:", error);
+      }
+    }
+  }
+
+  public async sendMessage(
+    to: string,
+    message: string
+  ): Promise<{ messageId: string | null; to: string }> {
+    if (!this.sock || !this.sock.user) {
+      const err: any = new Error("WhatsApp is not connected or authenticated.");
+      err.statusCode = 503;
+      throw err;
+    }
+
+    const digits = to.replace(/[^0-9]/g, "");
+    if (!digits) {
+      const err: any = new Error("Invalid phone number provided.");
+      err.statusCode = 400;
+      throw err;
+    }
+
+    const jid = to.includes("@") ? to : `${digits}@s.whatsapp.net`;
+    const result = await this.sock.sendMessage(jid, { text: message });
+
+    console.log(`Outbound message sent to ${digits} (ID: ${result?.key?.id})`);
+
+    return {
+      messageId: result?.key?.id || null,
+      to: digits,
+    };
+  }
+}
+
+export const whatsapp = new WhatsAppService();
+'@ | Set-Content -Path "src\whatsapp.ts" -Encoding UTF8
+
+    @'
+import express, { Request, Response } from "express";
+import { config } from "./config.js";
+import { whatsapp } from "./whatsapp.js";
+
+const app = express();
+app.use(express.json({ limit: "256kb" }));
+
+/**
+ * Health & WhatsApp connection status
+ */
+app.get("/health", (_req: Request, res: Response) => {
+  const isConnected = whatsapp.isConnected();
+
+  res.json({
+    status: "ok",
+    connected: isConnected,
+    authenticated: isConnected,
+    user: whatsapp.getUser(),
+    inboundWebhook: config.mainServiceInboundUrl,
+  });
+});
+
+/**
+ * Raw QR string for pairing via main backend / frontend UI
+ */
+app.get("/qr", (_req: Request, res: Response) => {
+  const isConnected = whatsapp.isConnected();
+  const qr = whatsapp.getQr();
+
+  res.json({
+    success: true,
+    authenticated: isConnected,
+    connected: isConnected,
+    qr,
+    message: isConnected
+      ? "WhatsApp is already connected."
+      : qr
+      ? "QR code available."
+      : "QR code is generating, please retry shortly.",
+  });
+});
+
+/**
+ * Outbound 1-on-1 message sending
+ */
+app.post(["/whatsapp/send", "/api/whatsapp/send"], async (req: Request, res: Response) => {
+  const to = (req.body.to || req.body.phone || req.body.recipient || "").toString().trim();
+  const message = (req.body.message || req.body.text || "").toString();
+
+  if (!to) {
+    return res.status(400).json({
+      success: false,
+      error: "Recipient phone number ('to') is required.",
+    });
+  }
+
+  if (!message || message.trim().length === 0) {
+    return res.status(400).json({
+      success: false,
+      error: "Message content ('message') cannot be empty.",
+    });
+  }
+
   try {
-    await sock.sendMessage(`${phone}@s.whatsapp.net`, { text });
-    res.json({ success: true, data: { sent: true }, error: null });
-  } catch (err) {
-    res.status(500).json({ success: false, data: null, error: { code: "send_failed", message: err.message } });
+    const result = await whatsapp.sendMessage(to, message);
+    return res.json({ success: true, ...result });
+  } catch (error: any) {
+    const status = error.statusCode || 500;
+    return res.status(status).json({
+      success: false,
+      error: error.message || "Failed to send WhatsApp message.",
+    });
   }
 });
 
-app.get("/health", (req, res) => {
-  res.json({ success: true, data: { status: "ok" }, error: null });
+// Start Express server and initialize WhatsApp Web
+app.listen(config.port, () => {
+  console.log(`WhatsApp Gateway running on port ${config.port}`);
+  console.log(`Inbound Webhook configured to: ${config.mainServiceInboundUrl}`);
+  whatsapp.init();
 });
-
-startWhatsApp();
-app.listen(3001, () => console.log("WhatsApp Service listening on :3001"));
-'@ | Set-Content -Path "index.js" -Encoding UTF8
+'@ | Set-Content -Path "src\server.ts" -Encoding UTF8
 
     @'
-MAIN_SERVICE_URL=http://main-service:8000
+# Server Port
+PORT=3000
+
+# WhatsApp Multi-file Auth Directory
+AUTH_DIR=./auth/whatsapp
+
+# Main Service Inbound Webhook URL (dispatches lightweight metadata payload)
+MAIN_SERVICE_INBOUND_URL=http://main-service:8000/api/whatsapp/inbound
 '@ | Set-Content -Path ".env.example" -Encoding UTF8
     Copy-Item ".env.example" ".env" -Force
 
+    Invoke-Native "npm install"
+
     Pop-Location
-    Write-Host "==> WhatsApp Service scaffolded (run it once standalone to scan the QR before the demo)"
+    Write-Host "==> WhatsApp Service scaffolded (TypeScript, run 'npm run dev' once standalone to scan the QR before the demo)"
 }
 
 # ============================================================================
@@ -1772,14 +2076,24 @@ COPY background-worker/ .
 CMD ["python", "main.py"]
 '@ | Set-Content -Path "background-worker\Dockerfile" -Encoding UTF8
 
+    # WhatsApp Service is now TypeScript: compile with tsc, run the built JS.
+    # Baileys auth state (./auth) is a runtime volume, not baked into the image.
     @'
+FROM node:20-slim AS build
+WORKDIR /app
+COPY package*.json tsconfig.json ./
+RUN npm install
+COPY src/ ./src/
+RUN npm run build
+
 FROM node:20-slim
 WORKDIR /app
+ENV NODE_ENV=production
 COPY package*.json ./
-RUN npm install
-COPY . .
-EXPOSE 3001
-CMD ["node", "index.js"]
+RUN npm install --omit=dev
+COPY --from=build /app/dist ./dist
+EXPOSE 3000
+CMD ["node", "dist/server.js"]
 '@ | Set-Content -Path "whatsapp-service\Dockerfile" -Encoding UTF8
 
     @'
@@ -1825,7 +2139,7 @@ services:
     environment:
       REDIS_URL: redis://redis_server:6379/0
       MAIN_SERVICE_URL: http://main-service:8000
-      WHATSAPP_SERVICE_URL: http://whatsapp-service:3001
+      WHATSAPP_SERVICE_URL: http://whatsapp-service:3000
       JOB_CALLBACK_URL: http://main-service:8000/api/internal/worker-result
     volumes:
       - ./ai-worker:/app
@@ -1843,7 +2157,7 @@ services:
     environment:
       REDIS_URL: redis://redis_server:6379/0
       MAIN_SERVICE_URL: http://main-service:8000
-      WHATSAPP_SERVICE_URL: http://whatsapp-service:3001
+      WHATSAPP_SERVICE_URL: http://whatsapp-service:3000
     volumes:
       - ./background-worker:/app
       - ./shared:/app/shared
@@ -1854,11 +2168,15 @@ services:
 
   whatsapp-service:
     build: ./whatsapp-service
-    env_file: .env
+    env_file: ./whatsapp-service/.env
     environment:
-      MAIN_SERVICE_URL: http://main-service:8000
+      PORT: 3000
+      AUTH_DIR: /app/auth/whatsapp
+      MAIN_SERVICE_INBOUND_URL: http://main-service:8000/api/whatsapp/inbound
     ports:
-      - "3001:3001"
+      - "3000:3000"
+    volumes:
+      - whatsapp_auth:/app/auth
     depends_on:
       - main-service
 
@@ -1872,6 +2190,7 @@ services:
 volumes:
   pgdata:
   media_data:
+  whatsapp_auth:
 '@ | Set-Content -Path "compose.yaml" -Encoding UTF8
 
     @'
@@ -1926,8 +2245,9 @@ deliverable - see docs/documentation-guide.md).
    coding-guidelines.md, testing-guidelines.md, documentation-guide.md,
    ux-guide.md, ui-guide.md).
 3. Pre-authenticate WhatsApp once, before the demo:
-   cd whatsapp-service; node index.js
-   (scan the QR code; ./auth/ then keeps the session logged in -- don't scan live)
+   cd whatsapp-service; npm run dev
+   (scan the QR code printed in the terminal, or GET /qr for the raw string;
+   ./auth/whatsapp then keeps the session logged in -- don't scan live)
 4. Build and run everything (3 AI worker replicas, per architecture.md):
    docker compose up -d --build --scale ai-worker=3
 5. Apply migrations:
@@ -1937,7 +2257,8 @@ deliverable - see docs/documentation-guide.md).
 7. Verify:
    - http://localhost:8000/health
    - http://localhost:8000/docs        (Swagger UI)
-   - http://localhost:3001/health      (WhatsApp Service)
+   - http://localhost:3000/health      (WhatsApp Service)
+   - http://localhost:3000/qr          (WhatsApp pairing QR, if not yet linked)
    - http://localhost:5173             (frontend)
 '@ | Set-Content -Path "SETUP.md" -Encoding UTF8
 
@@ -1954,7 +2275,7 @@ Write-Host " Next steps:"
 Write-Host "  1. cd $ProjectName"
 Write-Host "  2. Drop the 7 doc files into docs\"
 Write-Host "  3. .env files were auto-generated in each service folder -- open them and fill in real secrets/keys"
-Write-Host "  4. Pre-auth WhatsApp: cd whatsapp-service; node index.js (scan QR, then Ctrl+C)"
+Write-Host "  4. Pre-auth WhatsApp: cd whatsapp-service; npm run dev (scan QR, then Ctrl+C)"
 Write-Host "  5. docker compose up -d --build --scale ai-worker=3"
 Write-Host "  6. docker compose exec main-service python manage.py migrate"
 Write-Host "  7. docker compose exec main-service python manage.py createsuperuser"
