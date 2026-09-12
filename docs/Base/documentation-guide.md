@@ -1,5 +1,7 @@
 # Documentation Guide — CWA Ship Karachi 2026
 
+> **Antigravity Skill:** This guide has been converted into an Antigravity skill at [`docs/skills/documentation-guide/SKILL.md`](../skills/documentation-guide/SKILL.md).
+
 **Purpose:** Govern what gets written in Phase 8 (25 minutes). Same rule as coding and UX: every line fights for its place. Documentation that isn't read is worse than no documentation — it's wasted time on both ends.
 
 ## The Core Idea: Phase 8 Mostly Finalizes, Rarely Creates

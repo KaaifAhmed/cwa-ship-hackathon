@@ -1,5 +1,7 @@
 # Testing Guidelines — CWA Ship Karachi 2026
 
+> **Antigravity Skill:** This guide has been converted into an Antigravity skill at [`docs/skills/testing-guidelines/SKILL.md`](../skills/testing-guidelines/SKILL.md).
+
 **Purpose:** Prove the system actually works, at every level, without burying the team in test infrastructure they don't have time to manage. Minimal, meaningful, and understandable beats exhaustive.
 
 ## Philosophy

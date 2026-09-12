@@ -1,5 +1,7 @@
 # UI Guide — CWA Ship Karachi 2026
 
+> **Antigravity Skill:** This guide has been converted into an Antigravity skill at [`docs/skills/ui-guidelines/SKILL.md`](../skills/ui-guidelines/SKILL.md).
+
 **Purpose:** A professional, minimal, aesthetically considered UI — built on Material Design 3's structural system, with just enough left open to match the emotional tone of whatever problem we're handed. UI work only starts once the UX guide's journey map is locked.
 
 ## Stack

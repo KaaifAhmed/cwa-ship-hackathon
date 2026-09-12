@@ -1,5 +1,7 @@
 # Coding Guidelines — CWA Ship Karachi 2026
 
+> **Antigravity Skill:** This guide has been converted into an Antigravity skill at [`docs/skills/coding-guidelines/SKILL.md`](../skills/coding-guidelines/SKILL.md).
+
 **Purpose:** Production-grade code, written fast, by AI agents directed by us. These rules exist to keep every component simple, readable, and safely swappable — not to add process for its own sake.
 
 ## Core Philosophy

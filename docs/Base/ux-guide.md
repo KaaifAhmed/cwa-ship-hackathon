@@ -1,5 +1,7 @@
 # UX Guide — CWA Ship Karachi 2026
 
+> **Antigravity Skill:** This guide has been converted into an Antigravity skill at [`docs/skills/ux-guidelines/SKILL.md`](../skills/ux-guidelines/SKILL.md).
+
 **Purpose:** The frontend's only job is to serve the SRS — get the user to their goal in the fewest, clearest steps possible. UX is designed before a single screen is built. This document locks the *process*, since the actual journey can't be designed until the theme is known.
 
 ## Core Principle
